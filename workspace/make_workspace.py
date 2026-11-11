@@ -18,6 +18,9 @@ p.add_argument("--mount-euler", default="3.14159 0 0", help="3.14159 0 0 = finge
 p.add_argument("--palm-height", type=float, default=None, help="cm from the table to the palm body")
 p.add_argument("--table-height", type=float, default=75.0, help="cm from the factory floor to the table top")
 p.add_argument("--plain", action="store_true", help="no table or factory (floor at the table height)")
+p.add_argument("--free-cube", action="store_true", help="keep the stock free joint (cube can slide and tip)")
+p.add_argument("--damping", type=float, default=0.01)
+p.add_argument("--frictionloss", type=float, default=0.0, help="constant resisting torque on the cube hinge (N m)")
 args = p.parse_args()
 
 hand_dir = os.path.join(ASSETS, "hand")
@@ -112,6 +115,14 @@ scene_base = scene_stock.replace("robot_touch_sensors_92.xml", "robot_touch_sens
 for stock, name in ((STOCK_OBJ, "object"), (STOCK_TGT, "target")):
     assert stock in scene_base, f"{name} body not found"
     scene_base = scene_base.replace(stock, f'<body name="{name}" pos="1 0.87 {half:.4f}">')
+if not args.free_cube:
+    joint = (f'<joint name="object:yaw" type="hinge" axis="0 0 1" '
+             f'damping="{args.damping}" frictionloss="{args.frictionloss}"></joint>')
+    scene_base, n = re.subn(r'<joint name="object:joint"[^>]*>(\s*</joint>)?', joint, scene_base)
+    assert n == 1, "object:joint not found in the scene XML"
+    old = f'<body name="object" pos="1 0.87 {half:.4f}">'
+    assert old in scene_base
+    scene_base = scene_base.replace(old, f'<body name="object" pos="1 0.87 {half + 0.001:.4f}">')
 if not args.plain:
     scene_base = add_factory(scene_base)
 
