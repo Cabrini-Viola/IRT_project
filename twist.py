@@ -128,9 +128,9 @@ class TwistEnv(gym.Env):
             self._renderer.update_scene(self.data, camera=self._cam)
             return self._renderer.render()
         if self.render_mode == "human":
-            import mujoco.viewer
+            from mujoco import viewer as mj_viewer
             if self._viewer is None:
-                self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+                self._viewer = mj_viewer.launch_passive(self.model, self.data)
             self._viewer.sync()
 
     def close(self):
@@ -195,3 +195,4 @@ if __name__ == "__main__":
     else:
         import sac_her_pipeline
         sac_her_pipeline.main()
+        
