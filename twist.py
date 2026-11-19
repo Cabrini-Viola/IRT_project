@@ -188,10 +188,38 @@ def selftest():
               f"best {info['best_deg']:.0f} deg")
         e.close()
 
-
+def progress():
+    """python twist.py progress MODEL.zip VECNORM.pkl [SYNERGY.pkl ACT_SCALE]"""
+    import sac_her_pipeline as P
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+    a = sys.argv[2:]
+    model_zip, vec_pkl = a[0], a[1]
+    if len(a) > 2:
+        raw = DummyVecEnv([P.make_synergy_env(ENV_ID, P.load_synergy_bundle(a[2]),
+                                              act_scale=float(a[3]) if len(a) > 3 else 3.0)])
+    else:
+        raw = DummyVecEnv([P.make_full_env(ENV_ID)])
+    env = VecNormalize.load(vec_pkl, raw)
+    env.training, env.norm_reward = False, False
+    model = SAC.load(model_zip, env=env, device="cpu")
+    best, final, succ = [], [], []
+    for _ in range(20):
+        obs, done = env.reset(), False
+        while not done:
+            act, _ = model.predict(obs, deterministic=True)
+            obs, _, dones, infos = env.step(act)
+            done = bool(dones[0])
+        best.append(infos[0]["best_deg"])
+        final.append(infos[0]["angle_deg"])
+        succ.append(infos[0]["is_success"])
+    print(f"20 episodes: best angle mean {np.mean(best):.0f} deg, median {np.median(best):.0f}, "
+          f"max {np.max(best):.0f} | final angle mean {np.mean(final):+.0f} | success {np.mean(succ):.0%}")
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "selftest":
         selftest()
+    elif len(sys.argv) > 1 and sys.argv[1] == "progress":
+        progress()
     else:
         import sac_her_pipeline
         sac_her_pipeline.main()
