@@ -2,7 +2,15 @@
 """Twist task: tighten a yaw-only cube by goal_deg with the Shadow Hand fingers.
 
   python twist.py selftest
+  python twist.py progress MODEL.zip VECNORM.pkl [SYNERGY.pkl ACT_SCALE]
+  python twist.py video MODEL.zip VECNORM.pkl OUT.mp4 [EPISODES]     (needs MUJOCO_GL=egl)
   python twist.py --task train --env-id HandTwistCube-v0 [any sac_her_pipeline.py option]
+
+Environment variables read when the environment is registered:
+  TWIST_GOAL_DEG (default 360)      goal angle
+  TWIST_REWARD   (sparse | dense)   reward type, default sparse
+  TWIST_STALL    (default 0)        extra cost per step while the cube makes no new progress
+  TWIST_STALL_STEPS (default 15)    grace period (steps) before the stall cost starts
 """
 import os
 import sys
@@ -22,7 +30,8 @@ class TwistEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 25}
 
     def __init__(self, xml_path=DEFAULT_XML, goal_deg=360.0, tighten_sign=-1, lock_wrist=True,
-                 random_yaw=True, n_settle=10, render_mode=None):
+                 random_yaw=True, n_settle=10, dense=False, stall_penalty=0.0, stall_steps=15,
+                 render_mode=None):
         super().__init__()
         m = self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(m)
@@ -31,6 +40,8 @@ class TwistEnv(gym.Env):
         self.goal = np.radians(goal_deg)
         self.sign, self.lock_wrist = tighten_sign, lock_wrist
         self.random_yaw, self.n_settle = random_yaw, n_settle
+        self.dense = dense
+        self.stall_penalty, self.stall_steps, self.idle = stall_penalty, stall_steps, 0
 
         # cube hinge and hand joints
         jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "object:yaw")
@@ -94,8 +105,21 @@ class TwistEnv(gym.Env):
 
     # ---- gym API ----
     def compute_reward(self, achieved_goal, desired_goal, info=None):
-        ach, des = np.asarray(achieved_goal), np.asarray(desired_goal)
-        return np.where(ach[..., 0] >= des[..., 0] - 1e-6, 0.0, -1.0).astype(np.float32)
+        ach, des = np.asarray(achieved_goal)[..., 0], np.asarray(desired_goal)[..., 0]
+        if self.dense:
+            r = -np.clip(des - ach, 0.0, 2 * np.pi) / (2 * np.pi)
+        else:
+            r = np.where(ach >= des - 1e-6, 0.0, -1.0)
+        if self.stall_penalty > 0 and info is not None:
+            try:
+                if isinstance(info, dict):
+                    stall = float(info.get("stall", 0.0))
+                else:
+                    stall = np.array([float(i.get("stall", 0.0)) for i in info])
+                r = r - self.stall_penalty * stall
+            except Exception:
+                pass
+        return np.asarray(r, dtype=np.float32)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -105,17 +129,22 @@ class TwistEnv(gym.Env):
         mujoco.mj_forward(self.model, self.data)
         for _ in range(self.n_settle):
             self._apply(np.zeros(self.nu))
-        self.yaw0, self.best = float(self.data.qpos[self.yaw_q]), 0.0
+        self.yaw0, self.best, self.idle = float(self.data.qpos[self.yaw_q]), 0.0, 0
         return self._obs(), {"is_success": 0.0}
 
     def step(self, action):
         self._apply(action)
         ang = self._angle()
+        if ang > self.best + np.radians(0.1):
+            self.idle = 0
+        else:
+            self.idle += 1
         self.best = max(self.best, ang)
         obs = self._obs()
-        reward = float(self.compute_reward(obs["achieved_goal"], obs["desired_goal"]))
-        info = {"is_success": float(self.best >= self.goal),
+        stall = float(self.idle > self.stall_steps and self.best < self.goal)
+        info = {"is_success": float(self.best >= self.goal), "stall": stall,
                 "angle_deg": float(np.degrees(ang)), "best_deg": float(np.degrees(self.best))}
+        reward = float(self.compute_reward(obs["achieved_goal"], obs["desired_goal"], info))
         return obs, reward, False, False, info
 
     def render(self):
@@ -142,7 +171,10 @@ class TwistEnv(gym.Env):
 
 if ENV_ID not in gym.registry:
     gym.register(id=ENV_ID, entry_point=TwistEnv, max_episode_steps=150,
-                 kwargs={"goal_deg": float(os.environ.get("TWIST_GOAL_DEG", "360"))})
+                 kwargs={"goal_deg": float(os.environ.get("TWIST_GOAL_DEG", "360")),
+                         "dense": os.environ.get("TWIST_REWARD", "sparse") == "dense",
+                         "stall_penalty": float(os.environ.get("TWIST_STALL", "0")),
+                         "stall_steps": int(os.environ.get("TWIST_STALL_STEPS", "15"))})
 
 
 def selftest():
@@ -151,6 +183,8 @@ def selftest():
     obs, _ = env.reset(seed=0)
     print("observation:", obs["observation"].shape, "| action space:", env.action_space.shape)
     print(f"sensors in the XML: {base.model.nsensor}, touch sensors used: {base.n_touch}")
+    print(f"reward: {'dense' if base.dense else 'sparse'}, stall penalty {base.stall_penalty}, "
+          f"goal {np.degrees(base.goal):.0f} deg")
     t0, n = time.time(), 0
     for ep in range(3):
         env.reset(seed=ep)
@@ -188,6 +222,7 @@ def selftest():
               f"best {info['best_deg']:.0f} deg")
         e.close()
 
+
 def progress():
     """python twist.py progress MODEL.zip VECNORM.pkl [SYNERGY.pkl ACT_SCALE]"""
     import sac_her_pipeline as P
@@ -215,12 +250,57 @@ def progress():
         succ.append(infos[0]["is_success"])
     print(f"20 episodes: best angle mean {np.mean(best):.0f} deg, median {np.median(best):.0f}, "
           f"max {np.max(best):.0f} | final angle mean {np.mean(final):+.0f} | success {np.mean(succ):.0%}")
+
+
+def video():
+    """python twist.py video MODEL.zip VECNORM.pkl OUT.mp4 [EPISODES]   (set MUJOCO_GL=egl)"""
+    import imageio
+    from PIL import Image, ImageDraw
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+    model_zip, vec_pkl, out = sys.argv[2:5]
+    n_ep = int(sys.argv[5]) if len(sys.argv) > 5 else 5
+    raw = DummyVecEnv([lambda: gym.make(ENV_ID, render_mode="rgb_array")])
+    env = VecNormalize.load(vec_pkl, raw)
+    env.training, env.norm_reward = False, False
+    model = SAC.load(model_zip, env=env, device="cpu")
+    frames = []
+    for ep in range(n_ep):
+        obs, done = env.reset(), False
+        while not done:
+            act, _ = model.predict(obs, deterministic=True)
+            obs, _, dones, infos = env.step(act)
+            done, info = bool(dones[0]), infos[0]
+            if not done:
+                img = Image.fromarray(raw.envs[0].render())
+                ImageDraw.Draw(img).text(
+                    (10, 10), f"episode {ep + 1}   cube turned {info['angle_deg']:+.0f} deg   goal 360",
+                    fill=(255, 255, 255))
+                frames.append(np.asarray(img))
+        print(f"episode {ep + 1}: best {info['best_deg']:.0f} deg, final {info['angle_deg']:+.0f} deg, "
+              f"success {info['is_success']:.0f}")
+    imageio.mimsave(out, frames, fps=25)
+    print("saved", out, f"({len(frames)} frames)")
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "selftest":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "selftest":
         selftest()
-    elif len(sys.argv) > 1 and sys.argv[1] == "progress":
+    elif cmd == "progress":
         progress()
+    elif cmd == "video":
+        video()
     else:
+        if float(os.environ.get("TWIST_STALL", "0")) > 0:
+            # make hindsight replay store and pass the info dicts (with the stall flag) to compute_reward
+            from stable_baselines3 import HerReplayBuffer
+            _orig_init = HerReplayBuffer.__init__
+
+            def _init(self, *a, **kw):
+                kw.setdefault("copy_info_dict", True)
+                _orig_init(self, *a, **kw)
+
+            HerReplayBuffer.__init__ = _init
         import sac_her_pipeline
         sac_her_pipeline.main()
-        
