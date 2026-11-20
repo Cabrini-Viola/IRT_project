@@ -1,4 +1,4 @@
-"""Generate a 'hand above a table in a factory' variant of the Shadow Hand block scene."""
+"""Generate the 'hand above a table in a factory' scene (cube locked to yaw, or free with friction)."""
 import argparse, os, re, sys
 import mujoco
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,9 +18,14 @@ p.add_argument("--mount-euler", default="3.14159 0 0", help="3.14159 0 0 = finge
 p.add_argument("--palm-height", type=float, default=None, help="cm from the table to the palm body")
 p.add_argument("--table-height", type=float, default=75.0, help="cm from the factory floor to the table top")
 p.add_argument("--plain", action="store_true", help="no table or factory (floor at the table height)")
-p.add_argument("--free-cube", action="store_true", help="keep the stock free joint (cube can slide and tip)")
-p.add_argument("--damping", type=float, default=0.01)
-p.add_argument("--frictionloss", type=float, default=0.0, help="constant resisting torque on the cube hinge (N m)")
+p.add_argument("--free-cube", action="store_true", help="cube is a free body resting on the table (with friction)")
+p.add_argument("--damping", type=float, default=0.01, help="hinge damping (locked cube only)")
+p.add_argument("--frictionloss", type=float, default=0.0, help="hinge friction loss (locked cube only)")
+p.add_argument("--mu-table", type=float, default=0.5, help="sliding friction, table <-> cube")
+p.add_argument("--mu-cube", type=float, default=1.0, help="sliding friction on the cube's own faces (hand <-> cube)")
+p.add_argument("--torsional", type=float, default=0.005, help="torsional friction coefficient (length units)")
+p.add_argument("--rolling", type=float, default=0.0001, help="rolling friction coefficient")
+p.add_argument("--tag", default="ws", help="name suffix of the generated files")
 args = p.parse_args()
 
 hand_dir = os.path.join(ASSETS, "hand")
@@ -36,10 +41,12 @@ ASSET = ('<texture name="ws:floor_tex" type="2d" builtin="checker" rgb1="0.33 0.
          '<material name="ws:floor_mat" texture="ws:floor_tex" texrepeat="12 12" reflectance="0.15"></material>\n')
 
 
-def geom(name, kind, pos, size, rgba, collide=False, euler=None):
+def geom(name, kind, pos, size, rgba, collide=False, euler=None, friction=None):
     extra = "" if collide else ' contype="0" conaffinity="0"'
     if euler:
         extra += f' euler="{euler}"'
+    if friction:
+        extra += f' friction="{friction}"'
     return (f'<geom name="{name}" type="{kind}" pos="{pos[0]:.3f} {pos[1]:.3f} {pos[2]:.3f}" '
             f'size="{size}" rgba="{rgba}"{extra}></geom>\n')
 
@@ -48,7 +55,8 @@ def factory_xml(th):
     fz = -th  # factory floor height; the table top is at z = 0
     R, H = 2.2, 3.0  # half-width of the room, wall height
     g = []
-    g.append(geom("table_top", "box", (CX, CY, -0.02), "0.45 0.35 0.02", "0.62 0.64 0.67 1", collide=True))
+    g.append(geom("table_top", "box", (CX, CY, -0.02), "0.45 0.35 0.02", "0.62 0.64 0.67 1", collide=True,
+                  friction=f"{args.mu_table} {args.torsional} {args.rolling}"))
     for i, (sx, sy) in enumerate(((1, 1), (1, -1), (-1, 1), (-1, -1))):
         g.append(geom(f"table_leg{i}", "box", (CX + sx * 0.41, CY + sy * 0.31, (fz - 0.04) / 2),
                       f"0.03 0.03 {(th - 0.04) / 2:.3f}", "0.18 0.19 0.21 1"))
@@ -67,7 +75,6 @@ def factory_xml(th):
     for i, (sx, sy) in enumerate(((1, 1), (1, -1), (-1, 1), (-1, -1))):
         g.append(geom(f"column{i}", "cylinder", (CX + sx * (R - 0.25), CY + sy * (R - 0.25), mid),
                       f"0.15 {H / 2}", "0.25 0.30 0.40 1"))
-    # two machines with control panels and indicator lights, against the back wall
     yb = CY - R + 0.55
     g.append(geom("machine1", "box", (CX - 1.2, yb, fz + 0.7), "0.5 0.5 0.7", "0.20 0.38 0.62 1"))
     g.append(geom("panel1", "box", (CX - 1.2, yb + 0.51, fz + 1.0), "0.25 0.01 0.18", "0.05 0.06 0.07 1"))
@@ -77,7 +84,6 @@ def factory_xml(th):
     g.append(geom("panel2", "box", (CX + 1.2, yb + 0.51, fz + 0.9), "0.3 0.01 0.15", "0.05 0.06 0.07 1"))
     g.append(geom("pipe0", "cylinder", (CX, CY - R + 0.25, fz + 2.4), f"0.06 {R}", "0.6 0.62 0.65 1",
                   euler="0 1.5708 0"))
-    # conveyor along the right wall, with boxes on it
     cx = CX + R - 0.6
     g.append(geom("conv_base", "box", (cx, CY, fz + 0.2), "0.25 1.3 0.2", "0.20 0.21 0.24 1"))
     g.append(geom("conv_belt", "box", (cx, CY, fz + 0.45), "0.3 1.4 0.05", "0.08 0.08 0.09 1"))
@@ -85,7 +91,6 @@ def factory_xml(th):
     g.append(geom("conv_rail1", "box", (cx + 0.32, CY, fz + 0.55), "0.02 1.4 0.1", yel))
     for i, k in enumerate((-0.8, 0.0, 0.7)):
         g.append(geom(f"crate{i}", "box", (cx, CY + k, fz + 0.60), "0.1 0.1 0.1", "0.70 0.55 0.35 1"))
-    # yellow safety line on the floor around the table
     for i, (px, py, sx, sy) in enumerate(((0, 0.7, 0.75, 0.015), (0, -0.7, 0.75, 0.015),
                                           (0.75, 0, 0.015, 0.7), (-0.75, 0, 0.015, 0.7))):
         g.append(geom(f"floor_line{i}", "box", (CX + px, CY + py, fz + 0.003), f"{sx} {sy} 0.003", yel))
@@ -111,11 +116,20 @@ def add_factory(scene):
     return scene.replace("@@FACTORY@@", factory_xml(th))
 
 
-scene_base = scene_stock.replace("robot_touch_sensors_92.xml", "robot_touch_sensors_92_ws.xml")
+scene_base = scene_stock.replace("robot_touch_sensors_92.xml", f"robot_touch_sensors_92_{args.tag}.xml")
 for stock, name in ((STOCK_OBJ, "object"), (STOCK_TGT, "target")):
     assert stock in scene_base, f"{name} body not found"
     scene_base = scene_base.replace(stock, f'<body name="{name}" pos="1 0.87 {half:.4f}">')
-if not args.free_cube:
+
+if args.free_cube:
+    # free body: the cube's own faces carry the hand<->cube friction, the table pair is set below
+    scene_base, n = re.subn(r'<geom name="object" type="box"',
+                            f'<geom name="object" friction="{args.mu_cube} {args.torsional} {args.rolling}" type="box"',
+                            scene_base)
+    assert n == 1, "cube geom not found"
+    old = f'<body name="object" pos="1 0.87 {half:.4f}">'
+    scene_base = scene_base.replace(old, f'<body name="object" pos="1 0.87 {half + 0.0005:.4f}">')
+else:
     joint = (f'<joint name="object:yaw" type="hinge" axis="0 0 1" '
              f'damping="{args.damping}" frictionloss="{args.frictionloss}"></joint>')
     scene_base, n = re.subn(r'<joint name="object:joint"[^>]*>(\s*</joint>)?', joint, scene_base)
@@ -123,15 +137,22 @@ if not args.free_cube:
     old = f'<body name="object" pos="1 0.87 {half:.4f}">'
     assert old in scene_base
     scene_base = scene_base.replace(old, f'<body name="object" pos="1 0.87 {half + 0.001:.4f}">')
+
 if not args.plain:
     scene_base = add_factory(scene_base)
+    if args.free_cube:  # explicit table<->cube contact so its friction is independent of the hand's
+        pair = (f'<contact><pair geom1="table_top" geom2="object" condim="4" '
+                f'friction="{args.mu_table} {args.mu_table} {args.torsional} {args.rolling} {args.rolling}">'
+                f'</pair></contact>\n')
+        i = scene_base.rindex("</mujoco>")
+        scene_base = scene_base[:i] + pair + scene_base[i:]
 
 
 def write(mount_pos):
-    out = os.path.join(hand_dir, "manipulate_block_touch_sensors_ws.xml")
+    out = os.path.join(hand_dir, f"manipulate_block_touch_sensors_{args.tag}.xml")
     open(out, "w").write(scene_base)
     new = f'<body name="robot0:hand mount" pos="{mount_pos}" euler="{args.mount_euler}">'
-    open(os.path.join(hand_dir, "robot_touch_sensors_92_ws.xml"), "w").write(
+    open(os.path.join(hand_dir, f"robot_touch_sensors_92_{args.tag}.xml"), "w").write(
         robot_stock.replace(STOCK_MOUNT, new))
     return out
 
@@ -148,4 +169,8 @@ if args.palm_height is not None:
     mp[2] += args.palm_height / 100.0 - d.xpos[pid][2]
     out_scene = write(" ".join(f"{v:.4f}" for v in mp))
     print(f"palm body placed {args.palm_height} cm above the table (mount z = {mp[2]:.4f})")
+mode = (f"FREE cube, mu table {args.mu_table}, mu cube/hand {args.mu_cube}, "
+        f"torsional {args.torsional}, rolling {args.rolling}" if args.free_cube
+        else f"cube locked to yaw (damping {args.damping}, frictionloss {args.frictionloss})")
+print(mode)
 print("wrote", out_scene)
